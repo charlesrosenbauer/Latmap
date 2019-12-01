@@ -4,219 +4,222 @@
 
 
 
-
 typedef struct{
   uint64_t k, v;
-}KV_PAIR;
+}KV;
 
 
 
+typedef struct{
+  union{
+    void*    nodes[16];
+    KV       pairs[16];
+  }data;
+  int      size;
+}NODE;
+
+
+
+typedef struct{
+  uint64_t slicemaps[64];
+}SLICEMAP;
+
+
+uint64_t rng(uint64_t seed){
+  seed = (seed * 15378915136106581) + 183578614119697;
+  uint64_t rot = (seed >> 15) % 64;
+  seed = (seed >> rot) | (seed << (64 - rot));
+  return seed;
+}
+
+SLICEMAP newSlicemap(uint64_t seed){
+  SLICEMAP ret;
+  for(int i = 0; i < 64; i++){
+    int cont = 1;
+    uint64_t x = rng(i+56848);
+    while(cont){
+      x &= rng(x);
+      int match = 0;
+      if(__builtin_popcountl(x) == 15){
+        cont = 0;
+        for(int j = 0; j < i; j++){
+          match |= (ret.slicemaps[j] == x)? 1 : 0;
+        }
+        uint64_t last = (i > 0)? 0 : ret.slicemaps[i-1];
+        if(__builtin_popcountl(x & last) > 3){
+          cont = 1;
+        }
+        cont |= match;
+      }else{
+        x = rng(x);
+      }
+    }
+    ret.slicemaps[i] = x;
+  }
+  return ret;
+}
+
+void printBits(uint64_t x){
+  for(int i = 0; i < 64; i++){
+    char c = ((x >> i) & 1)? '#' : ' ';
+    printf("%c", c);
+  }
+  printf(" %i\n", __builtin_popcountl(x));
+}
+
+
+uint64_t rngBits(uint64_t seed, int bits){
+  while(1){
+    seed = rng(seed) & rng(seed+1);
+    if(__builtin_popcountl(seed) == bits) return seed;
+  }
+}
+
+
+int order(SLICEMAP* sm, int depth, uint64_t k){
+  int x = __builtin_popcountl(k & sm->slicemaps[depth]);
+  x += (k & ~sm->slicemaps[depth]) != 0;
+  x = (x < 2)? 0 : x - 1;
+  return x;
+}
+
+
+
+void insert(SLICEMAP* sm, NODE* latmap, KV kv, int depth){
+  int x = order(sm, depth, kv.k);
+
+  if(latmap->size < 16){
+    // Array insert
+    latmap->data.pairs[latmap->size] = kv;
+    latmap->size++;
+  }else if(latmap->size == 16){
+    // Phase change
+    KV kvs[17];
+    for(int i = 0; i < 16; i++){
+      kvs[i] = latmap->data.pairs[i];
+    }
+    kvs[16] = kv;
+
+    latmap->size = 17;
+    for(int i = 0; i < 16; i++){
+      latmap->data.nodes[i] = NULL;
+    }
+    for(int i = 0; i < 17; i++){
+      insert(sm, latmap, kvs[i], depth+1);
+    }
+  }else{
+    // Standard insert
+    NODE* n = latmap->data.nodes[x];
+    if(n == NULL){
+      // Allocate new node
+      n = malloc(sizeof(NODE));
+      n->size = 0;
+      latmap->data.nodes[x] = n;
+    }
+
+    insert(sm, n, kv, depth+1);
+  }
+}
+
+
+void leftpad(int pad){
+  for(int i = 0; i < pad; i++) printf(" ");
+}
+
+
+void printLatmap(NODE* latmap, int prefix, int depth){
+  leftpad(depth);
+  if(prefix >= 0) printf("%i ", prefix);
+
+  if(latmap->size <= 16){
+    printf("(Flat %i\n", latmap->size);
+    for(int i = 0; i < latmap->size; i++){
+      leftpad(depth+2);
+      printBits(latmap->data.pairs[i].k);
+    }
+  }else{
+    int nilct = 0;
+    for(int i = 0; i < 16; i++){
+      if(latmap->data.nodes[i] == NULL) nilct++;
+    }
+    printf("(Fork %i\n", 16-nilct);
+
+    for(int i = 0; i < 16; i++){
+      NODE* n = latmap->data.nodes[i];
+      if(n != NULL){
+        printLatmap(n, i, depth+2);
+      }
+    }
+  }
+
+  leftpad(depth);
+  printf(")\n");
+}
 
 
 /*
-  This particular latmap is specialized toward 64-bit bitvector keys and uint64
-  values. It is also hardcoded for a max of 32 layers. This is not meant to be a
-  robust design, just a proof of concept.
+  Depth-first-search
 */
-typedef union{
-  struct{
-    uint64_t keys[16];
-    uint64_t vals[16];
-  } kvs;
-  struct{
-    void* nodes[32];
-  } pts;
-}NODE_DATA;
-
-typedef struct{
-  NODE_DATA data;
-  int size, depth;
-}LATMAP_NODE;
-
-
-typedef struct{
-  uint64_t filter[32];
-  LATMAP_NODE* roots[64];
-}LATMAP_HEADER;
-
-
-
-inline int getTopLevelBucket(uint64_t k){
-  int pct = __builtin_popcountl(k);
-  return (pct > 63)? 63 : pct;
-}
-
-inline int getBucket(uint64_t k, LATMAP_HEADER* h, int depth){
-  if(depth > 32) return 0;
-  int pct = __builtin_popcountl(k & h->filter[depth]);
-  return (pct > 31)? 31 : pct;
-}
-
-
-void mkLatmap(uint64_t rngseed, uint64_t factor, LATMAP_HEADER* ret){
-  uint64_t shiftRegister = rngseed;
-  for(int i = 0; i < 32; i++){
-    int j = 0;
-
-    // Random number generator
-    while((j < 64) || (__builtin_popcountl(shiftRegister) != 32)){
-      j++;
-      shiftRegister = (shiftRegister ^ ((0 - (shiftRegister & 1)) & factor));
-      shiftRegister = (shiftRegister >> 1) | (shiftRegister << 63);
-    }
-    ret->filter[i] = shiftRegister;
-  }
-
-  // Nullify all buckets to start
-  for(int i = 0; i < 64; i++) ret->roots[i] = NULL;
-}
-
-
-void insert(LATMAP_HEADER* latmap, uint64_t key, uint64_t val){
-
-  // First off, figure out which top-level bucket to put it in
-  int top = getTopLevelBucket(key);
-
-  // If the top-level bucket node doesn't exist, allocate a node, insert, done.
-  if(latmap->roots[top] == NULL){
-    latmap->roots[top] = malloc(sizeof(LATMAP_NODE));
-    latmap->roots[top]->size = 1;
-    latmap->roots[top]->data.kvs.keys[0] = key;
-    latmap->roots[top]->data.kvs.vals[0] = val;
-    return;
-  }
-
-  // Iterate down the tree until a location is found.
-  LATMAP_NODE* node = latmap->roots[top];
-  int depth = 0;
-  while(1){
-    if(node->size < 16){ // Node has some free local space. Insert, done.
-      node->data.kvs.keys[node->size] = key;
-      node->data.kvs.vals[node->size] = val;
-      node->size++;
-      return;
-    }
-    if(node->size == 16){ // Node overflow! This is a tricky case!
-      LATMAP_NODE* pts[32];
-      for(int i = 0; i < 32; i++) pts[i] = NULL;
-
-      uint16_t bucketset = 0;
-      int buckets[17];
-      for(int i = 0; i < 16; i++){
-        buckets[i] = getBucket(node->data.kvs.keys[i], latmap, depth);
-        bucketset |= (1 << buckets[i]);
+int subset(SLICEMAP* sm, NODE* latmap, int depth, uint64_t k, KV* ret, int limit){
+  if(latmap == NULL) return 0;
+  if(latmap->size <= 16){
+    int max = (limit > latmap->size)? latmap->size : limit;
+    int ix  = 0;
+    for(int i = 0; i < max; i++){
+      if((latmap->data.pairs[i].k & k) == latmap->data.pairs[i].k){
+        ret[ix] = latmap->data.pairs[i];
+        ix++;
       }
-      buckets [16] = getBucket(key, latmap, depth);
-      bucketset |= (1 << buckets[16]);
-      if(__builtin_popcountl(bucketset) == 1){
-        // Check for duplicate, replace if one is found. Done.
-        for(int i = 0; i < 16; i++){
-          if(node->data.kvs.keys[i] == key){
-            node->data.kvs.vals[i] = val;
-            return;
-          }
-        }
-
-        // Not sure how to best handle this case, but it's pretty unlikely.
-        // Let's ignore it for now.
-        printf("Error at depth %i, bucket %i.\n", depth, buckets[16]);
-        for(int i = 0; i < 16; i++){
-          printf("  %lu\n", node->data.kvs.keys[i]);
-        } printf("  %lu\n", key);
-        exit(-1);
-      }
-      // Sort items into sub-buckets and return.
-      for(int i = 0; i < 17; i++){
-        if(pts[i] == NULL){
-          pts[i] = malloc(sizeof(LATMAP_NODE));
-          pts[i]->size = 1;
-          pts[i]->data.kvs.keys[0] = node->data.kvs.keys[i];
-          pts[i]->data.kvs.vals[0] = node->data.kvs.vals[i];
-        }else{
-          int ix = pts[i]->size;
-          pts[i]->data.kvs.keys[ix]= node->data.kvs.keys[ix];
-          pts[i]->data.kvs.vals[ix]= node->data.kvs.vals[ix];
-          pts[i]->size++;
-        }
-      }
-      node->size = 17;  // Full I guess
-      for(int i = 0; i < 16; i++) node->data.pts.nodes[i] = pts[i];
-      return;
     }
-    // Node has no free space, we must go deeper.
-    int bucket = getBucket(key, latmap, depth);
-    LATMAP_NODE* newnode = node->data.pts.nodes[bucket];
-    if(newnode == NULL){
-      node->data.pts.nodes[bucket] = malloc(sizeof(LATMAP_NODE));
-      ((LATMAP_NODE*)node->data.pts.nodes[bucket])->size = 0;
+    return ix;
+  }
+
+  int x = order(sm, depth, k);
+  int count = 0;
+  for(int i = x; i >= 0; i--){
+    int gain = subset(sm, latmap->data.nodes[i], depth+1, k, &ret[count], limit-count);
+    count += gain;
+    if(count >= limit){
+      return limit;
     }
-    node = node->data.pts.nodes[bucket];
-    depth++;
   }
+  return count;
 }
 
-
-int subsetLookup(uint64_t k, LATMAP_HEADER* latmap, int limit, KV_PAIR* ret){
-  int maxBucket = getTopLevelBucket(k);
-  int ct = 0, ix = maxBucket;
-  while((ct <= limit) && (ix > 0)){
-
-    //
-
-  }
-  return 0;
-}
-
-
-int supsetLookup(uint64_t k, LATMAP_HEADER* latmap, int limit, KV_PAIR* ret){
-  return 0;
-}
-
-
-int betweenLookup(uint64_t ksup, uint64_t ksub, LATMAP_HEADER* latmap, int limit, KV_PAIR* ret){
-  return 0;
-}
-
-
-uint64_t rstate = 718903561806071l;
-uint64_t fastRNG(){
-  rstate = (rstate * 58262467180937l) + 87501871526226381l;
-  rstate ^= 3518971089716242429l;
-  int rshift = rstate >> 58;
-  rstate = (rstate >> rshift) | (rstate << rshift);
-  return rstate;
-}
-
-
-void printbin(uint64_t x){
-  for(int i = 63; i >= 0; i--)
-    printf((x & (1l << i))? "#" : " ");
-  printf("\n");
-}
 
 
 int main(){
-  LATMAP_HEADER latmap;
-  mkLatmap(891508971l, 0x8000000100300701, &latmap);
-  for(int i = 0; i < 32; i++){
-    printbin(latmap.filter[i]);
-  }
-
-  for(int i = 0; i < 1024; i++){
-    uint64_t x = ((1l << ((fastRNG() >>  8) % 64)
-                | (1l << ((fastRNG() >>  9) % 64))
-                | (1l << ((fastRNG() >>  7) % 64))
-                | (1l << ((fastRNG() >> 11) % 64))
-                | (1l << ((fastRNG() >> 23) % 64))));
-    printf("%i : %lu\n", i, x);
-    insert(&latmap, x, i);
-  }
-
+  SLICEMAP sm = newSlicemap(51231);
   for(int i = 0; i < 64; i++){
-    int x = 0;
-    if(latmap.roots[i] != NULL){
-      x = latmap.roots[i]->size;
-    }
-    printf("%i %i\n", i, x);
+    printBits(sm.slicemaps[i]);
   }
+
+  int size = 4096;
+  KV* kvs = malloc(sizeof(KV) * size);
+  for(int i = 0; i < size; i++){
+    kvs[i].k = rngBits(i, 12);
+  }
+
+  NODE latmap;
+  latmap.size = 0;
+
+  for(int i = 0; i < size; i++){
+    insert(&sm, &latmap, kvs[i], 0);
+  }
+
+  printLatmap(&latmap, -1, 0);
+
+  for(int i = 0; i < 16; i++){
+    uint64_t k = rng(513+i);
+    KV buffer[16];
+    int x = subset(&sm, &latmap, 0, k, buffer, 16);
+    printf("%i:\n", x);
+    printf("--");
+    printBits(k);
+    for(int i = 0; i < x; i++){
+      printf("==");
+      printBits(buffer[i].k);
+    }
+  }
+
 }
